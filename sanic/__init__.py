@@ -21,6 +21,7 @@ from sanic.exceptions import (
     SanicException,
     ServerError,
     ServiceUnavailable,
+    TaskExistsError,
     Unauthorized,
 )
 from sanic.request import Request
@@ -74,6 +75,7 @@ __all__ = (
     "SanicException",
     "ServerError",
     "ServiceUnavailable",
+    "TaskExistsError",
     "Unauthorized",
     # Common response methods
     "empty",

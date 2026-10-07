@@ -391,6 +391,12 @@ class StartupMixin(metaclass=SanicMeta):
             self.multiplexer.terminate()
         if self.state.stage is not ServerStage.STOPPED:
             self.shutdown_tasks(timeout=0)  # type: ignore
+            # Cancel every internal server driver task tracked on this app.
+            # Identity tracking reaches all of them even when several
+            # AsyncioServers share the "RunServer" task name.
+            for task in tuple(getattr(self, "_server_tasks", ())):
+                if not task.done():
+                    task.cancel()
             for task in all_tasks():
                 with suppress(AttributeError):
                     if task.get_name() == "RunServer":
@@ -1050,8 +1056,8 @@ class StartupMixin(metaclass=SanicMeta):
                         message = "".join(message_parts)
                         error_logger.warning(message, exc_info=True)
                         continue
-                    primary.add_task(
-                        self._run_server(app, server_info), name="RunServer"
+                    primary._add_server_task(
+                        self._run_server(app, server_info)
                     )
 
     async def _run_server(

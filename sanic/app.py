@@ -55,6 +55,7 @@ from sanic.exceptions import (
     BadRequest,
     SanicException,
     ServerError,
+    TaskExistsError,
     URLBuildError,
 )
 from sanic.handlers import ErrorHandler
@@ -139,6 +140,7 @@ class Sanic(
         "_future_statics",
         "_inspector",
         "_manager",
+        "_server_tasks",
         "_state",
         "_task_registry",
         "_test_client",
@@ -304,6 +306,10 @@ class Sanic(
         self._manager: WorkerManager | None = None
         self._state: ApplicationState = ApplicationState(app=self)
         self._task_registry: dict[str, Task | None] = {}
+        # Internal AsyncioServer driver tasks (named "RunServer...").
+        # They are tracked by identity rather than by name so that shutdown
+        # can reach every server task even when several run concurrently.
+        self._server_tasks: set[Task] = set()
         self._test_client: Any = None
         self._test_manager: Any = None
         self.asgi = False
@@ -1343,7 +1349,24 @@ class Sanic(
         *,
         name: str | None = None,
         register: bool = True,
+        replace: bool = False,
     ) -> Task:
+        if name and register:
+            existing = app._task_registry.get(name)
+            if existing is not None and not existing.done():
+                if not replace:
+                    # The new work is never scheduled, so a raw coroutine
+                    # passed by the caller can be closed safely. Tasks and
+                    # futures remain the caller's responsibility.
+                    if asyncio.iscoroutine(task):
+                        task.close()
+                    raise TaskExistsError(name, existing)
+                # Explicit replacement: cancel the incumbent before the new
+                # work starts. The replacement is installed under the name
+                # only after the conflict has been resolved, so the existing
+                # handle can never be silently lost.
+                existing.cancel()
+
         tsk: Task = task
         if not isinstance(task, Future):
             prepped = cls._prep_task(task, app, loop)
@@ -1378,13 +1401,23 @@ class Sanic(
         *,
         name: str | None = None,
         register: bool = True,
+        replace: bool = False,
     ) -> Task[Any] | None:
-        """项目内部接口说明。"""
+        """Schedule a background task.
+
+        When ``name`` is given and a live task is already registered under
+        that name, the call fails deterministically with
+        :class:`TaskExistsError` instead of silently dropping the existing
+        handle. Callers can either:
+
+        * reuse the running task via :meth:`get_task` (or
+          ``TaskExistsError.task``),
+        * replace it explicitly with ``replace=True`` (the incumbent is
+          cancelled), or
+        * await a fully drained replacement with :meth:`replace_task`.
+        """
         try:
             loop = self.loop  # Will raise SanicError if loop is not started
-            return self._loop_add_task(
-                task, self, loop, name=name, register=register
-            )
         except SanicException:
             task_name = f"sanic.delayed_task.{hash(task)}"
             if not self._delayed_tasks:
@@ -1398,6 +1431,37 @@ class Sanic(
             self.signal(task_name)(partial(self.run_delayed_task, task=task))
             self._delayed_tasks.append(task_name)
             return None
+
+        return self._loop_add_task(
+            task,
+            self,
+            loop,
+            name=name,
+            register=register,
+            replace=replace,
+        )
+
+    async def replace_task(
+        self,
+        name: str,
+        task: Future[Any] | Coroutine[Any, Any, Any] | Awaitable[Any],
+    ) -> Task[Any]:
+        """Cancel a named task and register a replacement under its name.
+
+        The incumbent is cancelled before the replacement starts, and this
+        coroutine only resolves once the incumbent has finished cancelling,
+        giving the caller a definite hand-off point.
+        """
+        existing = self.get_task(name, raise_exception=False)
+        tsk = self.add_task(task, name=name, replace=True)
+        if (
+            existing is not None
+            and existing is not tsk
+            and not existing.done()
+        ):
+            with suppress(CancelledError):
+                await existing
+        return tsk  # type: ignore[return-value]
 
     @overload
     def get_task(
@@ -1432,7 +1496,11 @@ class Sanic(
         *,
         raise_exception: bool = True,
     ) -> None:
-        """项目内部接口说明。"""
+        """Cancel the task currently registered under ``name``.
+
+        Only the live incumbent is cancelled; a task that previously held
+        the name but was replaced is left untouched.
+        """
         task = self.get_task(name, raise_exception=raise_exception)
         if task and not task.cancelled():
             if msg and sys.version_info < (3, 14):
@@ -1445,23 +1513,26 @@ class Sanic(
                 ...
 
     def purge_tasks(self) -> None:
-        """项目内部接口说明。"""
-        for key, task in self._task_registry.items():
-            if task is None:
-                continue
-            if task.done() or task.cancelled():
-                self._task_registry[key] = None
+        """Drop finished tasks from the registry.
 
-        self._task_registry = {
-            k: v for k, v in self._task_registry.items() if v is not None
-        }
+        A name is only removed when the task *currently* occupying the slot
+        is finished; a replacement task registered under the same name is
+        never purged because an older holder completed.
+        """
+        for name in tuple(self._task_registry):
+            incumbent = self._task_registry[name]
+            if incumbent is None or incumbent.done():
+                self._task_registry.pop(name, None)
 
     def shutdown_tasks(
         self, timeout: float | None = None, increment: float = 0.1
     ) -> None:
         """项目内部接口说明。"""
+        # Named, registered tasks only. Internal AsyncioServer driver tasks
+        # live in self._server_tasks and are cancelled separately via stop()
+        # so that shutting user tasks down never touches the wrong job.
         for task in self.tasks:
-            if task.get_name() != "RunServer":
+            if not task.done():
                 task.cancel()
 
         if timeout is None:
@@ -1482,6 +1553,19 @@ class Sanic(
             for task in iter(self._task_registry.values())
             if task is not None
         )
+
+    def _add_server_task(self, coro: Coroutine[Any, Any, Any]) -> Task[Any]:
+        """Track an internal AsyncioServer driver task by identity.
+
+        These tasks intentionally bypass the named registry: several may
+        coexist when an app serves multiple sockets, and naming them all
+        "RunServer" would let later registrations overwrite the earlier
+        handles (making them unqueryable and uncancellable by name).
+        """
+        task = self.loop.create_task(coro, name="RunServer")
+        self._server_tasks.add(task)
+        task.add_done_callback(self._server_tasks.discard)
+        return task
 
     # -------------------------------------------------------------------- #
     # ASGI

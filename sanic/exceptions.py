@@ -343,3 +343,16 @@ class WebsocketClosed(SanicException):
 
     quiet = True
     message = "Client has closed the websocket connection"
+
+
+class TaskExistsError(SanicException):
+    """Raised when registering a named task clashes with a live task."""
+
+    def __init__(self, name: str, task: Any | None = None):
+        self.name = name
+        self.task = task
+        super().__init__(
+            f'A task named "{name}" is already registered and still '
+            'running. Reuse it with Sanic.get_task(name), or register '
+            "the replacement explicitly with add_task(..., replace=True)."
+        )
